@@ -147,8 +147,29 @@ func countPendingWaitersByHolder(tx *bbolt.Tx, holder string) (int, error) {
 	return count, nil
 }
 
-// EnqueueWaiter grants a lease immediately if the resource is free; otherwise
-// queues a pending waiter.
+// appendPendingWaiter creates a fresh waiter for resource in the pending state
+// (i.e. at the tail of the wait queue) and persists it, writing the result
+// into out. It does not touch the lease itself.
+func appendPendingWaiter(tx *bbolt.Tx, resource, holder string, ttl time.Duration, now time.Time, out *lease.Waiter) error {
+	seq, err := nextWaiterSeq(tx)
+	if err != nil {
+		return err
+	}
+	*out = lease.Waiter{
+		ID: newWaiterID(seq), Resource: resource, Holder: holder, TTLSeconds: int64(ttl / time.Second),
+		CreatedAt: now, Status: lease.WaiterPending,
+	}
+	return putWaiter(tx, *out)
+}
+
+// EnqueueWaiter grants a lease immediately if the resource is free and nobody
+// is queued for it; otherwise it queues a pending waiter at the tail of the
+// wait queue.
+//
+// When the resource has expired, the freed lease does not leap-frog the
+// existing wait queue: the oldest pending waiter is promoted first (FIFO) and
+// this new request waits behind it. Only when no waiter is queued is the
+// request granted the lease right away.
 func (s *Store) EnqueueWaiter(resource, holder string, ttl time.Duration, now time.Time) (lease.Waiter, error) {
 	var w lease.Waiter
 	err := s.db.Update(func(tx *bbolt.Tx) error {
@@ -156,43 +177,61 @@ func (s *Store) EnqueueWaiter(resource, holder string, ttl time.Duration, now ti
 		if err != nil {
 			return err
 		}
-		if !exists || !existing.Active(now) {
-			// Resource is free: grant a lease now and return a granted waiter.
-			if err := enforceQuota(tx, holder, now, 1); err != nil {
-				return err
-			}
-			token, err := allocToken(tx)
-			if err != nil {
-				return err
-			}
-			l := lease.Lease{
-				Resource: resource, Holder: holder, Token: token,
-				Deadline: now.Add(ttl), Acquired: now, TTLSeconds: int64(ttl / time.Second),
-			}
-			if err := putLease(tx, l); err != nil {
-				return err
-			}
-			if err := appendAudit(tx, now, lease.ActionAcquire, resource, holder, token, "waiter immediate"); err != nil {
-				return err
-			}
-			seq, err := nextWaiterSeq(tx)
-			if err != nil {
-				return err
-			}
-			w = lease.Waiter{
-				ID: newWaiterID(seq), Resource: resource, Holder: holder, TTLSeconds: int64(ttl / time.Second),
-				CreatedAt: now, Status: lease.WaiterGranted, GrantedToken: token,
-			}
-			return putWaiter(tx, w)
+		if exists && existing.Active(now) {
+			// Resource is held: this request joins the tail of the wait queue.
+			return appendPendingWaiter(tx, resource, holder, ttl, now, &w)
 		}
-		// Resource held: queue a pending waiter.
+
+		// Resource is free or has expired. An expired lease is reaped first so
+		// its expiry is recorded, mirroring ExpireAll.
+		if exists {
+			if err := deleteLease(tx, resource); err != nil {
+				return err
+			}
+			if err := appendAudit(tx, now, lease.ActionExpire, existing.Resource, existing.Holder, existing.Token, "reaped on enqueue"); err != nil {
+				return err
+			}
+		}
+
+		// FIFO: if a waiter is already queued for this resource, the freed
+		// lease goes to the oldest one and this new request waits behind it
+		// rather than jumping the queue.
+		_, hasWaiter, err := oldestPendingWaiter(tx, resource)
+		if err != nil {
+			return err
+		}
+		if hasWaiter {
+			if _, err := promoteWaiterFor(tx, resource, now); err != nil {
+				return err
+			}
+			return appendPendingWaiter(tx, resource, holder, ttl, now, &w)
+		}
+
+		// Nobody is waiting: grant a lease to this request immediately.
+		if err := enforceQuota(tx, holder, now, 1); err != nil {
+			return err
+		}
+		token, err := allocToken(tx)
+		if err != nil {
+			return err
+		}
+		l := lease.Lease{
+			Resource: resource, Holder: holder, Token: token,
+			Deadline: now.Add(ttl), Acquired: now, TTLSeconds: int64(ttl / time.Second),
+		}
+		if err := putLease(tx, l); err != nil {
+			return err
+		}
+		if err := appendAudit(tx, now, lease.ActionAcquire, resource, holder, token, "waiter immediate"); err != nil {
+			return err
+		}
 		seq, err := nextWaiterSeq(tx)
 		if err != nil {
 			return err
 		}
 		w = lease.Waiter{
 			ID: newWaiterID(seq), Resource: resource, Holder: holder, TTLSeconds: int64(ttl / time.Second),
-			CreatedAt: now, Status: lease.WaiterPending,
+			CreatedAt: now, Status: lease.WaiterGranted, GrantedToken: token,
 		}
 		return putWaiter(tx, w)
 	})
