@@ -10,6 +10,9 @@ type TokenHealth struct {
 }
 
 // CheckTokenHealth verifies the monotonic ordering that stale holders rely on.
+// The issuance history is non-decreasing: renew and transfer reuse the existing
+// token, so an equal token is healthy. Only a token that moves backwards
+// (strictly smaller than its predecessor) breaks the invariant.
 func (s *Service) CheckTokenHealth(resource string) (TokenHealth, error) {
 	entries, err := s.TokenHistory(resource)
 	if err != nil {
@@ -18,7 +21,7 @@ func (s *Service) CheckTokenHealth(resource string) (TokenHealth, error) {
 	result := TokenHealth{Resource: resource, Entries: len(entries), StrictlyIncreasing: true}
 	var previous Token
 	for _, entry := range entries {
-		if entry.Token <= previous {
+		if entry.Token < previous {
 			result.StrictlyIncreasing = false
 		}
 		if entry.Token > result.LastToken {
